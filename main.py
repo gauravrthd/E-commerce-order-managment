@@ -1,45 +1,37 @@
-from fastapi  import FastAPI 
-from pydantic import BaseModel
+from fastapi import FastAPI
 
-app = FastAPI()
+from routers import (
+    user_router,
+    category_router,
+    product_router,
+    cart_router,
+    order_router,
+    order_item_router,
+    cancellation_router,
+    review_router,
+    payment_router
+)
 
-
-class Product(BaseModel):
-    name : str 
-    categories : str
-    price : int 
-
-
-products = [
-    Product(
-        name = "laptop",
-        categories= "electronic",
-        price = 50000
-
-    ),
-    Product(
-        name= "Shoes",
-        categories= "Footwear",
-        price = 500
-    ),
-    Product(
-        name = "table",
-        categories= "Furniture",
-        price = 1500
-
-    )
-]
-
-@app.get("/welcome")
-def wel_come():
-    return "FastAPI started Now ! "
+app = FastAPI(
+    title="E-Commerce Order Management System",
+    description="FastAPI Module 3 - Routing and Error Handling",
+    version="1.0.0"
+)
 
 
-@app.post("/product")
-def create_product(product : Product):
-    products.append(product)
-    return product
+@app.get("/", tags=["Home"])
+def welcome():
+    return {
+        "message": "Welcome to my E-Commerce Order Management System!"
+    }
 
-@app.get("/products", response_model=list[Product])
-def get_all_product():
-    return products
+
+app.include_router(user_router.router)
+app.include_router(category_router.router)
+app.include_router(product_router.router)
+app.include_router(cart_router.router)
+app.include_router(order_router.router)
+app.include_router(order_item_router.router)
+app.include_router(cancellation_router.router)
+app.include_router(review_router.router)
+app.include_router(payment_router.router)

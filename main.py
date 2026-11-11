@@ -1,6 +1,10 @@
+
 from fastapi import FastAPI
+from routers import auth_router
+
 
 from routers import (
+    auth_router,
     user_router,
     category_router,
     product_router,
@@ -14,18 +18,18 @@ from routers import (
 
 app = FastAPI(
     title="E-Commerce Order Management System",
-    description="FastAPI Module 3 - Routing and Error Handling",
     version="1.0.0"
 )
 
 
-@app.get("/", tags=["Home"])
+@app.get("/")
 def welcome():
     return {
-        "message": "Welcome to my E-Commerce Order Management System!"
+        "message": "Welcome to E-Commerce Order Management System"
     }
 
 
+app.include_router(auth_router.router)
 app.include_router(user_router.router)
 app.include_router(category_router.router)
 app.include_router(product_router.router)

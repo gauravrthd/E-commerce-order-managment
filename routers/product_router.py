@@ -1,78 +1,76 @@
 
 from fastapi import APIRouter, Depends, HTTPException
-from typing import Optional
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from database.connection import get_db
+from models.product_model import Product
+from models.category_model import Category
+from models.user_model import User
+from models.cart_model import Cart
+from models.order_item_model import OrderItem
 from schema.product_schema import (
     ProductCreate, ProductUpdate, ProductResponse
 )
-from utils.store import db, next_id
-from utils.dependencies import allow_roles, get_current_user
+from utils.dependencies import allow_roles
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
 
-def check_seller(product, user):
-    if user["role"] == "admin":
-        return
-
-    if product["seller_id"] != user["id"]:
-        raise HTTPException(403, "You can manage only your products")
-
-
 @router.post("/", response_model=ProductResponse, status_code=201)
 def create_product(
-    product: ProductCreate,
-    user=Depends(allow_roles("shopkeeper", "admin"))
+    data: ProductCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("shopkeeper", "admin"))
 ):
-    if product.category_id not in db["categories"]:
+    if not db.get(Category, data.category_id):
         raise HTTPException(404, "Category not found")
 
-    seller = db["users"].get(product.seller_id)
+    seller = db.get(User, data.seller_id)
 
-    if not seller or seller["role"] != "shopkeeper":
-        raise HTTPException(400, "Invalid shopkeeper ID")
+    if not seller or seller.role != "shopkeeper":
+        raise HTTPException(400, "Invalid shopkeeper")
 
-    if user["role"] == "shopkeeper" and product.seller_id != user["id"]:
-        raise HTTPException(403, "Cannot create products for other sellers")
+    if user.role == "shopkeeper" and user.id != data.seller_id:
+        raise HTTPException(403, "Cannot create another seller's product")
 
-    product_id = next_id("products")
+    product = Product(**data.model_dump())
 
-    data = product.model_dump()
-    data["id"] = product_id
+    db.add(product)
+    db.commit()
+    db.refresh(product)
 
-    db["products"][product_id] = data
-    return data
+    return product
 
 
 @router.get("/", response_model=list[ProductResponse])
 def get_products(
-    category_id: Optional[int] = None,
-    min_price: Optional[float] = None,
-    max_price: Optional[float] = None
+    category_id: int | None = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    db: Session = Depends(get_db)
 ):
-    products = list(db["products"].values())
+    query = select(Product)
 
     if category_id is not None:
-        products = [
-            p for p in products if p["category_id"] == category_id
-        ]
+        query = query.where(Product.category_id == category_id)
 
     if min_price is not None:
-        products = [
-            p for p in products if p["price"] >= min_price
-        ]
+        query = query.where(Product.price >= min_price)
 
     if max_price is not None:
-        products = [
-            p for p in products if p["price"] <= max_price
-        ]
+        query = query.where(Product.price <= max_price)
 
-    return products
+    return db.scalars(query).all()
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
-def get_product(product_id: int):
-    product = db["products"].get(product_id)
+def get_product(
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    product = db.get(Product, product_id)
 
     if not product:
         raise HTTPException(404, "Product not found")
@@ -84,72 +82,95 @@ def get_product(product_id: int):
 def replace_product(
     product_id: int,
     data: ProductCreate,
-    user=Depends(allow_roles("shopkeeper", "admin"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("shopkeeper", "admin"))
 ):
-    old = db["products"].get(product_id)
+    product = db.get(Product, product_id)
 
-    if not old:
+    if not product:
         raise HTTPException(404, "Product not found")
 
-    check_seller(old, user)
+    if user.role != "admin" and product.seller_id != user.id:
+        raise HTTPException(403, "Access denied")
 
-    if data.category_id not in db["categories"]:
+    if not db.get(Category, data.category_id):
         raise HTTPException(404, "Category not found")
 
-    if data.seller_id != old["seller_id"]:
-        raise HTTPException(400, "Cannot change the product seller")
+    if data.seller_id != product.seller_id:
+        raise HTTPException(400, "Cannot change product seller")
 
-    updated = {"id": product_id, **data.model_dump()}
-    db["products"][product_id] = updated
+    for key, value in data.model_dump().items():
+        setattr(product, key, value)
 
-    return updated
+    db.commit()
+    db.refresh(product)
+
+    return product
 
 
 @router.patch("/{product_id}", response_model=ProductResponse)
 def update_product(
     product_id: int,
     data: ProductUpdate,
-    user=Depends(allow_roles("shopkeeper", "admin"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("shopkeeper", "admin"))
 ):
-    product = db["products"].get(product_id)
+    product = db.get(Product, product_id)
 
     if not product:
         raise HTTPException(404, "Product not found")
 
-    check_seller(product, user)
+    if user.role != "admin" and product.seller_id != user.id:
+        raise HTTPException(403, "Access denied")
 
     updates = data.model_dump(exclude_unset=True)
 
+    if any(
+        value is None and key != "description"
+        for key, value in updates.items()
+    ):
+        raise HTTPException(422, "Invalid null value")
+
     if "category_id" in updates:
-        if updates["category_id"] not in db["categories"]:
+        if not db.get(Category, updates["category_id"]):
             raise HTTPException(404, "Category not found")
 
-    product.update(updates)
+    for key, value in updates.items():
+        setattr(product, key, value)
+
+    db.commit()
+    db.refresh(product)
+
     return product
 
 
 @router.delete("/{product_id}", status_code=204)
 def delete_product(
     product_id: int,
-    user=Depends(allow_roles("shopkeeper", "admin"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("shopkeeper", "admin"))
 ):
-    product = db["products"].get(product_id)
+    product = db.get(Product, product_id)
 
     if not product:
         raise HTTPException(404, "Product not found")
 
-    check_seller(product, user)
+    if user.role != "admin" and product.seller_id != user.id:
+        raise HTTPException(403, "Access denied")
 
-    if any(
-        item["product_id"] == product_id
-        for item in db["order_items"].values()
-    ):
-        raise HTTPException(
-            409, "Product has order history and cannot be deleted"
-        )
+    existing_order = db.scalar(
+        select(OrderItem.id).where(OrderItem.product_id == product_id)
+    )
 
-    for cart_id, item in list(db["cart"].items()):
-        if item["product_id"] == product_id:
-            del db["cart"][cart_id]
+    if existing_order is not None:
+        raise HTTPException(409, "Product has order history")
 
-    del db["products"][product_id]
+    cart_items = db.scalars(
+        select(Cart).where(Cart.product_id == product_id)
+    ).all()
+
+    for item in cart_items:
+        db.delete(item)
+
+    db.delete(product)
+    db.commit()

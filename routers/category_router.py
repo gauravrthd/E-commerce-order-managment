@@ -1,10 +1,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from database.connection import get_db
+from models.category_model import Category
 from schema.category_schema import (
     CategoryCreate, CategoryUpdate, CategoryResponse
 )
-from utils.store import db, next_id
 from utils.dependencies import allow_roles
 
 router = APIRouter(prefix="/categories", tags=["Categories"])
@@ -12,32 +16,42 @@ router = APIRouter(prefix="/categories", tags=["Categories"])
 
 @router.post("/", response_model=CategoryResponse, status_code=201)
 def create_category(
-    category: CategoryCreate,
-    user=Depends(allow_roles("admin"))
+    data: CategoryCreate,
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("admin"))
 ):
-    if any(
-        c["name"].lower() == category.name.lower()
-        for c in db["categories"].values()
-    ):
+    existing = db.scalar(
+        select(Category).where(Category.name == data.name)
+    )
+
+    if existing:
         raise HTTPException(409, "Category already exists")
 
-    category_id = next_id("categories")
+    category = Category(**data.model_dump())
 
-    data = category.model_dump()
-    data["id"] = category_id
+    db.add(category)
 
-    db["categories"][category_id] = data
-    return data
+    try:
+        db.commit()
+        db.refresh(category)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Category already exists")
+
+    return category
 
 
 @router.get("/", response_model=list[CategoryResponse])
-def get_categories():
-    return list(db["categories"].values())
+def get_categories(db: Session = Depends(get_db)):
+    return db.scalars(select(Category)).all()
 
 
 @router.get("/{category_id}", response_model=CategoryResponse)
-def get_category(category_id: int):
-    category = db["categories"].get(category_id)
+def get_category(
+    category_id: int,
+    db: Session = Depends(get_db)
+):
+    category = db.get(Category, category_id)
 
     if not category:
         raise HTTPException(404, "Category not found")
@@ -49,60 +63,76 @@ def get_category(category_id: int):
 def replace_category(
     category_id: int,
     data: CategoryCreate,
-    user=Depends(allow_roles("admin"))
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("admin"))
 ):
-    if category_id not in db["categories"]:
+    category = db.get(Category, category_id)
+
+    if not category:
         raise HTTPException(404, "Category not found")
 
-    for category in db["categories"].values():
-        if (
-            category["id"] != category_id
-            and category["name"].lower() == data.name.lower()
-        ):
-            raise HTTPException(409, "Category already exists")
+    for key, value in data.model_dump().items():
+        setattr(category, key, value)
 
-    updated = {"id": category_id, **data.model_dump()}
-    db["categories"][category_id] = updated
-    return updated
+    try:
+        db.commit()
+        db.refresh(category)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Category name already exists")
+
+    return category
 
 
 @router.patch("/{category_id}", response_model=CategoryResponse)
 def update_category(
     category_id: int,
     data: CategoryUpdate,
-    user=Depends(allow_roles("admin"))
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("admin"))
 ):
-    category = db["categories"].get(category_id)
+    category = db.get(Category, category_id)
 
     if not category:
         raise HTTPException(404, "Category not found")
 
     updates = data.model_dump(exclude_unset=True)
 
-    if "name" in updates and updates["name"] is not None:
-        if any(
-            c["id"] != category_id
-            and c["name"].lower() == updates["name"].lower()
-            for c in db["categories"].values()
-        ):
-            raise HTTPException(409, "Category already exists")
+    if updates.get("name", "valid") is None:
+        raise HTTPException(422, "Category name cannot be null")
 
-    category.update(updates)
+    for key, value in updates.items():
+        setattr(category, key, value)
+
+    try:
+        db.commit()
+        db.refresh(category)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Category name already exists")
+
     return category
 
 
 @router.delete("/{category_id}", status_code=204)
 def delete_category(
     category_id: int,
-    user=Depends(allow_roles("admin"))
+    db: Session = Depends(get_db),
+    admin=Depends(allow_roles("admin"))
 ):
-    if category_id not in db["categories"]:
+    from models.product_model import Product
+
+    category = db.get(Category, category_id)
+
+    if not category:
         raise HTTPException(404, "Category not found")
 
-    if any(
-        p["category_id"] == category_id
-        for p in db["products"].values()
-    ):
+    product = db.scalar(
+        select(Product.id).where(Product.category_id == category_id)
+    )
+
+    if product is not None:
         raise HTTPException(409, "Category contains products")
 
-    del db["categories"][category_id]
+    db.delete(category)
+    db.commit()

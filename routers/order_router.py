@@ -1,129 +1,159 @@
 
-from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
+from database.connection import get_db
+from models.user_model import User
+from models.product_model import Product
+from models.cart_model import Cart
+from models.order_model import Order
+from models.order_item_model import OrderItem
 from schema.order_schema import (
     OrderCreate, OrderUpdate, OrderResponse
 )
-from utils.store import db, next_id
-from utils.dependencies import (
-    get_current_user, allow_roles,
-    get_order_items, can_manage_order
-)
+from utils.dependencies import get_current_user, allow_roles
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
 @router.post("/", response_model=OrderResponse, status_code=201)
 def create_order(
-    order: OrderCreate,
-    user=Depends(allow_roles("customer"))
+    data: OrderCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
 ):
-    if order.user_id != user["id"]:
-        raise HTTPException(403, "Cannot place another user's order")
+    if data.user_id != user.id:
+        raise HTTPException(403, "Access denied")
 
-    cart_items = [
-        item for item in db["cart"].values()
-        if item["user_id"] == user["id"]
-    ]
+    if not data.shipping_address.strip():
+        raise HTTPException(400, "Shipping address is required")
+
+    cart_items = db.scalars(
+        select(Cart)
+        .where(Cart.user_id == user.id)
+        .order_by(Cart.product_id)
+        .with_for_update()
+    ).all()
 
     if not cart_items:
         raise HTTPException(400, "Cart is empty")
 
-    total = 0
+    product_ids = sorted({item.product_id for item in cart_items})
 
-    # Validate all products and stock before creating the order.
+    products = db.scalars(
+        select(Product)
+        .where(Product.id.in_(product_ids))
+        .order_by(Product.id)
+        .with_for_update()
+    ).all()
+
+    product_map = {product.id: product for product in products}
+    total = Decimal("0.00")
+
     for item in cart_items:
-        product = db["products"].get(item["product_id"])
+        product = product_map.get(item.product_id)
 
         if not product:
             raise HTTPException(404, "Product not found")
 
-        if item["quantity"] > product["stock"]:
-            raise HTTPException(400, "Insufficient stock")
+        if product.stock < item.quantity:
+            raise HTTPException(
+                400,
+                f"Insufficient stock for {product.name}"
+            )
 
-        total += product["price"] * item["quantity"]
+        total += product.price * item.quantity
 
-    order_id = next_id("orders")
+    order = Order(
+        user_id=user.id,
+        total_amount=total,
+        shipping_address=data.shipping_address,
+        order_status="pending"
+    )
 
-    new_order = {
-        "id": order_id,
-        "user_id": user["id"],
-        "total_amount": round(total, 2),
-        "shipping_address": order.shipping_address,
-        "order_status": "pending",
-        "created_at": datetime.now(timezone.utc)
-    }
+    try:
+        db.add(order)
+        db.flush()
 
-    db["orders"][order_id] = new_order
+        for item in cart_items:
+            product = product_map[item.product_id]
 
-    for item in cart_items:
-        product = db["products"][item["product_id"]]
+            order_item = OrderItem(
+                order_id=order.id,
+                product_id=product.id,
+                quantity=item.quantity,
+                price=product.price
+            )
 
-        order_item_id = next_id("order_items")
+            product.stock -= item.quantity
 
-        db["order_items"][order_item_id] = {
-            "id": order_item_id,
-            "order_id": order_id,
-            "product_id": item["product_id"],
-            "quantity": item["quantity"],
-            "price": product["price"]
-        }
+            db.add(order_item)
+            db.delete(item)
 
-        product["stock"] -= item["quantity"]
-        del db["cart"][item["id"]]
+        db.commit()
+        db.refresh(order)
 
-    return new_order
+    except Exception:
+        db.rollback()
+        raise
+
+    return order
 
 
 @router.get("/", response_model=list[OrderResponse])
-def get_orders(user=Depends(get_current_user)):
-    orders = list(db["orders"].values())
+def get_orders(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    if user.role == "admin":
+        query = select(Order)
 
-    if user["role"] == "admin":
-        return orders
+    elif user.role == "customer":
+        query = select(Order).where(Order.user_id == user.id)
 
-    if user["role"] == "customer":
-        return [
-            o for o in orders
-            if o["user_id"] == user["id"]
-        ]
+    elif user.role == "shopkeeper":
+        query = (
+            select(Order)
+            .join(OrderItem, OrderItem.order_id == Order.id)
+            .join(Product, Product.id == OrderItem.product_id)
+            .where(Product.seller_id == user.id)
+            .distinct()
+        )
 
-    if user["role"] == "shopkeeper":
-        return [
-            o for o in orders
-            if any(
-                db["products"].get(
-                    item["product_id"], {}
-                ).get("seller_id") == user["id"]
-                for item in get_order_items(o["id"])
-            )
-        ]
+    else:
+        raise HTTPException(403, "Access denied")
 
-    return []
+    return db.scalars(query.order_by(Order.id.desc())).all()
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
-def get_order(order_id: int, user=Depends(get_current_user)):
-    order = db["orders"].get(order_id)
+def get_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    order = db.get(Order, order_id)
 
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if user["role"] == "customer":
-        if order["user_id"] != user["id"]:
-            raise HTTPException(403, "Access denied")
+    if user.role == "customer" and order.user_id != user.id:
+        raise HTTPException(403, "Access denied")
 
-    elif user["role"] == "shopkeeper":
-        has_product = any(
-            db["products"].get(
-                item["product_id"], {}
-            ).get("seller_id") == user["id"]
-            for item in get_order_items(order_id)
+    if user.role == "shopkeeper":
+        seller_product = db.scalar(
+            select(OrderItem.id)
+            .join(Product, Product.id == OrderItem.product_id)
+            .where(
+                OrderItem.order_id == order_id,
+                Product.seller_id == user.id
+            )
         )
 
-        if not has_product:
+        if seller_product is None:
             raise HTTPException(403, "Access denied")
 
     return order
@@ -133,35 +163,47 @@ def get_order(order_id: int, user=Depends(get_current_user)):
 def update_order_status(
     order_id: int,
     data: OrderUpdate,
-    user=Depends(allow_roles("shopkeeper", "admin"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("shopkeeper", "admin"))
 ):
-    order = db["orders"].get(order_id)
+    order = db.scalar(
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+    )
 
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if not can_manage_order(user, order_id):
-        raise HTTPException(403, "Cannot manage this order")
+    if user.role == "shopkeeper":
+        items = db.scalars(
+            select(OrderItem)
+            .where(OrderItem.order_id == order_id)
+        ).all()
 
-    new_status = data.order_status
+        if not items:
+            raise HTTPException(403, "Access denied")
 
-    if new_status is None:
-        raise HTTPException(400, "Order status is required")
+        seller_ids = {
+            db.get(Product, item.product_id).seller_id
+            for item in items
+        }
 
-    allowed_transitions = {
+        if seller_ids != {user.id}:
+            raise HTTPException(403, "Cannot manage this order")
+
+    transitions = {
         "pending": "confirmed",
         "confirmed": "shipped",
         "shipped": "delivered"
     }
 
-    current_status = order["order_status"]
+    if transitions.get(order.order_status) != data.order_status:
+        raise HTTPException(400, "Invalid order status change")
 
-    if allowed_transitions.get(current_status) != new_status:
-        raise HTTPException(
-            400,
-            f"Cannot change order from {current_status} to {new_status}"
-        )
+    order.order_status = data.order_status
 
-    order["order_status"] = new_status
+    db.commit()
+    db.refresh(order)
 
     return order

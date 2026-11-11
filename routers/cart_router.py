@@ -1,10 +1,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
-from schema.cart_schema import (
-    CartCreate, CartUpdate, CartResponse
-)
-from utils.store import db, next_id
+from database.connection import get_db
+from models.cart_model import Cart
+from models.product_model import Product
+from models.user_model import User
+from schema.cart_schema import CartCreate, CartUpdate, CartResponse
 from utils.dependencies import allow_roles
 
 router = APIRouter(prefix="/cart", tags=["Cart"])
@@ -12,88 +16,128 @@ router = APIRouter(prefix="/cart", tags=["Cart"])
 
 @router.post("/", response_model=CartResponse, status_code=201)
 def add_to_cart(
-    cart: CartCreate,
-    user=Depends(allow_roles("customer"))
+    data: CartCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
 ):
-    if cart.user_id != user["id"]:
-        raise HTTPException(403, "Cannot add items to another user's cart")
+    if data.user_id != user.id:
+        raise HTTPException(403, "Access denied")
 
-    product = db["products"].get(cart.product_id)
+    product = db.get(Product, data.product_id)
 
     if not product:
         raise HTTPException(404, "Product not found")
 
-    existing = next(
-        (
-            item for item in db["cart"].values()
-            if item["user_id"] == user["id"]
-            and item["product_id"] == cart.product_id
-        ),
-        None
+    if data.quantity > product.stock:
+        raise HTTPException(400, "Insufficient stock")
+
+    existing = db.scalar(
+        select(Cart).where(
+            Cart.user_id == user.id,
+            Cart.product_id == data.product_id
+        )
     )
 
     if existing:
-        raise HTTPException(409, "Product already exists in cart")
+        raise HTTPException(409, "Product already in cart")
 
-    if cart.quantity > product["stock"]:
-        raise HTTPException(400, "Insufficient stock")
+    cart = Cart(
+        user_id=user.id,
+        product_id=data.product_id,
+        quantity=data.quantity
+    )
 
-    cart_id = next_id("cart")
-    data = cart.model_dump()
-    data["id"] = cart_id
+    db.add(cart)
 
-    db["cart"][cart_id] = data
-    return data
+    try:
+        db.commit()
+        db.refresh(cart)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Product already in cart")
+
+    return cart
 
 
 @router.get("/", response_model=list[CartResponse])
-def get_my_cart(user=Depends(allow_roles("customer"))):
-    return [
-        item for item in db["cart"].values()
-        if item["user_id"] == user["id"]
-    ]
+def get_cart(
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
+):
+    return db.scalars(
+        select(Cart).where(Cart.user_id == user.id)
+    ).all()
+
+
+@router.get("/{cart_id}", response_model=CartResponse)
+def get_cart_item(
+    cart_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
+):
+    cart = db.get(Cart, cart_id)
+
+    if not cart:
+        raise HTTPException(404, "Cart item not found")
+
+    if cart.user_id != user.id:
+        raise HTTPException(403, "Access denied")
+
+    return cart
 
 
 @router.patch("/{cart_id}", response_model=CartResponse)
 def update_cart(
     cart_id: int,
     data: CartUpdate,
-    user=Depends(allow_roles("customer"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
 ):
-    cart = db["cart"].get(cart_id)
+    cart = db.get(Cart, cart_id)
 
     if not cart:
         raise HTTPException(404, "Cart item not found")
 
-    if cart["user_id"] != user["id"]:
+    if cart.user_id != user.id:
         raise HTTPException(403, "Access denied")
 
     updates = data.model_dump(exclude_unset=True)
 
-    quantity = updates.get("quantity", cart["quantity"])
-    product = db["products"].get(cart["product_id"])
+    if not updates or updates.get("quantity") is None:
+        raise HTTPException(400, "Quantity is required")
+
+    if updates["quantity"] <= 0:
+        raise HTTPException(400, "Invalid quantity")
+
+    product = db.get(Product, cart.product_id)
 
     if not product:
         raise HTTPException(404, "Product not found")
 
-    if quantity > product["stock"]:
+    if updates["quantity"] > product.stock:
         raise HTTPException(400, "Insufficient stock")
 
-    cart.update(updates)
+    cart.quantity = updates["quantity"]
+
+    db.commit()
+    db.refresh(cart)
+
     return cart
 
 
 @router.delete("/{cart_id}", status_code=204)
 def remove_from_cart(
     cart_id: int,
-    user=Depends(allow_roles("customer"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
 ):
-    cart = db["cart"].get(cart_id)
+    cart = db.get(Cart, cart_id)
 
     if not cart:
         raise HTTPException(404, "Cart item not found")
 
-    if cart["user_id"] != user["id"]:
+    if cart.user_id != user.id:
         raise HTTPException(403, "Access denied")
 
-    del db["cart"][cart_id]
+    db.delete(cart)
+    db.commit()

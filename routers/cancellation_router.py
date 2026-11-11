@@ -1,121 +1,189 @@
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
+from database.connection import get_db
+from models.user_model import User
+from models.order_model import Order
+from models.order_item_model import OrderItem
+from models.product_model import Product
+from models.cancellation_model import Cancellation
+from models.payment_model import Payment
 from schema.cancellation_schema import (
-    CancellationCreate, CancellationUpdate,
-    CancellationResponse
+    CancellationCreate, CancellationUpdate, CancellationResponse
 )
-from utils.store import db, next_id
-from utils.dependencies import (
-    get_current_user, allow_roles, get_order_items
-)
+from utils.dependencies import get_current_user, allow_roles
 
 router = APIRouter(
     prefix="/cancellations",
-    tags=["Order Cancellations"]
+    tags=["Cancellations"]
 )
 
 
 @router.post("/", response_model=CancellationResponse, status_code=201)
 def request_cancellation(
     data: CancellationCreate,
-    user=Depends(allow_roles("customer"))
+    db: Session = Depends(get_db),
+    user: User = Depends(allow_roles("customer"))
 ):
-    order = db["orders"].get(data.order_id)
+    order = db.get(Order, data.order_id)
 
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if order["user_id"] != user["id"]:
+    if order.user_id != user.id:
         raise HTTPException(403, "Access denied")
 
-    if order["order_status"] not in ["pending", "confirmed"]:
+    if order.order_status not in ["pending", "confirmed"]:
         raise HTTPException(400, "Order cannot be cancelled")
 
-    if any(
-        c["order_id"] == data.order_id
-        for c in db["cancellations"].values()
-    ):
+    existing = db.scalar(
+        select(Cancellation).where(
+            Cancellation.order_id == data.order_id
+        )
+    )
+
+    if existing:
         raise HTTPException(409, "Cancellation already requested")
 
-    if any(
-        p["order_id"] == data.order_id
-        and p["payment_status"] == "success"
-        for p in db["payments"].values()
-    ):
-        raise HTTPException(
-            409, "Paid order needs refund handling before cancellation"
-        )
+    payment = db.scalar(
+        select(Payment).where(Payment.order_id == data.order_id)
+    )
 
-    cancellation_id = next_id("cancellations")
+    if payment and payment.payment_status == "success":
+        raise HTTPException(409, "Paid order requires refund handling")
 
-    cancellation = {
-        "id": cancellation_id,
-        "order_id": data.order_id,
-        "reason": data.reason,
-        "cancellation_status": "pending"
-    }
+    cancellation = Cancellation(
+        order_id=data.order_id,
+        reason=data.reason,
+        cancellation_status="pending"
+    )
 
-    db["cancellations"][cancellation_id] = cancellation
+    db.add(cancellation)
+
+    try:
+        db.commit()
+        db.refresh(cancellation)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Cancellation already exists")
+
     return cancellation
 
 
 @router.get("/", response_model=list[CancellationResponse])
-def get_cancellations(user=Depends(get_current_user)):
-    cancellations = list(db["cancellations"].values())
-
-    if user["role"] == "admin":
-        return cancellations
-
-    if user["role"] == "customer":
-        return [
-            c for c in cancellations
-            if db["orders"][c["order_id"]]["user_id"] == user["id"]
-        ]
-
-    raise HTTPException(403, "Access denied")
-
-
-@router.patch(
-    "/{cancellation_id}",
-    response_model=CancellationResponse
-)
-def update_cancellation(
-    cancellation_id: int,
-    data: CancellationUpdate,
-    admin=Depends(allow_roles("admin"))
+def get_cancellations(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
 ):
-    cancellation = db["cancellations"].get(cancellation_id)
+    if user.role == "admin":
+        query = select(Cancellation)
+
+    elif user.role == "customer":
+        query = (
+            select(Cancellation)
+            .join(Order, Order.id == Cancellation.order_id)
+            .where(Order.user_id == user.id)
+        )
+
+    else:
+        raise HTTPException(403, "Access denied")
+
+    return db.scalars(query).all()
+
+
+@router.get("/{cancellation_id}", response_model=CancellationResponse)
+def get_cancellation(
+    cancellation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    cancellation = db.get(Cancellation, cancellation_id)
 
     if not cancellation:
         raise HTTPException(404, "Cancellation not found")
 
-    if cancellation["cancellation_status"] != "pending":
+    order = db.get(Order, cancellation.order_id)
+
+    if user.role != "admin" and order.user_id != user.id:
+        raise HTTPException(403, "Access denied")
+
+    return cancellation
+
+
+@router.patch("/{cancellation_id}", response_model=CancellationResponse)
+def update_cancellation(
+    cancellation_id: int,
+    data: CancellationUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(allow_roles("admin"))
+):
+    cancellation = db.scalar(
+        select(Cancellation)
+        .where(Cancellation.id == cancellation_id)
+        .with_for_update()
+    )
+
+    if not cancellation:
+        raise HTTPException(404, "Cancellation not found")
+
+    if cancellation.cancellation_status != "pending":
         raise HTTPException(400, "Cancellation already processed")
 
     if data.cancellation_status not in ["approved", "rejected"]:
-        raise HTTPException(400, "Use approved or rejected")
+        raise HTTPException(400, "Invalid cancellation status")
 
-    order = db["orders"][cancellation["order_id"]]
+    order = db.scalar(
+        select(Order)
+        .where(Order.id == cancellation.order_id)
+        .with_for_update()
+    )
 
     if data.cancellation_status == "approved":
-        if order["order_status"] not in ["pending", "confirmed"]:
-            raise HTTPException(409, "Order can no longer be cancelled")
+        if order.order_status not in ["pending", "confirmed"]:
+            raise HTTPException(400, "Order cannot be cancelled")
 
-        if any(
-            p["order_id"] == order["id"]
-            and p["payment_status"] == "success"
-            for p in db["payments"].values()
-        ):
+        payment = db.scalar(
+            select(Payment)
+            .where(Payment.order_id == order.id)
+            .with_for_update()
+        )
+
+        if payment and payment.payment_status == "success":
             raise HTTPException(409, "Refund handling required")
 
-        for item in get_order_items(order["id"]):
-            product = db["products"].get(item["product_id"])
+        items = db.scalars(
+            select(OrderItem)
+            .where(OrderItem.order_id == order.id)
+            .order_by(OrderItem.product_id)
+        ).all()
 
-            if product:
-                product["stock"] += item["quantity"]
+        product_ids = sorted({item.product_id for item in items})
 
-        order["order_status"] = "cancelled"
+        products = db.scalars(
+            select(Product)
+            .where(Product.id.in_(product_ids))
+            .order_by(Product.id)
+            .with_for_update()
+        ).all()
 
-    cancellation["cancellation_status"] = data.cancellation_status
+        product_map = {product.id: product for product in products}
+
+        for item in items:
+            product = product_map.get(item.product_id)
+
+            if not product:
+                raise HTTPException(409, "Order product not found")
+
+            product.stock += item.quantity
+
+        order.order_status = "cancelled"
+
+    cancellation.cancellation_status = data.cancellation_status
+
+    db.commit()
+    db.refresh(cancellation)
+
     return cancellation

@@ -8,3 +8,4 @@ from models.order_item_model import OrderItem
 from models.cancellation_model import Cancellation
 from models.review_model import Review
 from models.payment_model import Payment
+from models.auth_session_model import AuthSession

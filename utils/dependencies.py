@@ -1,17 +1,51 @@
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+from jwt.exceptions import InvalidTokenError
 
-from fastapi import Header, HTTPException, Depends
-from utils.store import db
+from database.connection import get_db
+from models.user_model import User
+from models.auth_session_model import AuthSession
+from utils.security import decode_token
+
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
 
 def get_current_user(
-    x_user_id: int = Header(alias="X-User-Id")
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
 ):
-    user = db["users"].get(x_user_id)
+    try:
+        payload = decode_token(token, "access")
+        user_id = int(payload["sub"])
+        session_id = payload["sid"]
+
+    except (InvalidTokenError, ValueError, TypeError, KeyError):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    auth_session = db.get(AuthSession, session_id)
+
+    if (
+        not auth_session
+        or auth_session.revoked
+        or auth_session.user_id != user_id
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired or revoked"
+        )
+
+    user = db.get(User, user_id)
 
     if not user:
         raise HTTPException(
             status_code=401,
-            detail="Invalid demo user ID"
+            detail="User not found"
         )
 
     return user
@@ -19,43 +53,21 @@ def get_current_user(
 
 def allow_roles(*roles):
 
-    def check_role(user=Depends(get_current_user)):
-        if user["role"] not in roles:
+    def check_role(user: User = Depends(get_current_user)):
+        if user.role not in roles:
             raise HTTPException(
                 status_code=403,
-                detail="You do not have permission"
+                detail="Permission denied"
             )
+
         return user
 
     return check_role
 
 
-def check_owner_or_admin(user, owner_id):
-    if user["role"] != "admin" and user["id"] != owner_id:
+def check_owner_or_admin(user: User, owner_id: int):
+    if user.role != "admin" and user.id != owner_id:
         raise HTTPException(
             status_code=403,
             detail="Access denied"
         )
-
-
-def get_order_items(order_id):
-    return [
-        item for item in db["order_items"].values()
-        if item["order_id"] == order_id
-    ]
-
-
-def can_manage_order(user, order_id):
-    if user["role"] == "admin":
-        return True
-
-    if user["role"] != "shopkeeper":
-        return False
-
-    items = get_order_items(order_id)
-
-    return bool(items) and all(
-        db["products"].get(item["product_id"], {}).get("seller_id")
-        == user["id"]
-        for item in items
-    )

@@ -1,7 +1,4 @@
-
 from fastapi import FastAPI
-from routers import auth_router
-
 
 from routers import (
     auth_router,
@@ -17,15 +14,14 @@ from routers import (
 )
 
 app = FastAPI(
-    title="E-Commerce Order Management System",
-    version="1.0.0"
+    title="E-Commerce Order Management System"
 )
 
 
 @app.get("/")
 def welcome():
     return {
-        "message": "Welcome to E-Commerce Order Management System"
+        "message": "Welcome to my E-Commerce Order Management System!"
     }
 
 

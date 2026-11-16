@@ -10,10 +10,18 @@ from models.category_model import Category
 from models.user_model import User
 from models.cart_model import Cart
 from models.order_item_model import OrderItem
+from models.review_model import Review
+
 from schema.product_schema import (
     ProductCreate, ProductUpdate, ProductResponse
 )
 from utils.dependencies import allow_roles
+
+from cache.redis_cache import (
+    get_cached_products,
+    set_cached_products,
+    invalidate_product_cache
+)
 
 router = APIRouter(prefix="/products", tags=["Products"])
 
@@ -38,8 +46,15 @@ def create_product(
     product = Product(**data.model_dump())
 
     db.add(product)
-    db.commit()
-    db.refresh(product)
+
+    try:
+        db.commit()
+        db.refresh(product)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "Could not create product")
+
+    invalidate_product_cache()
 
     return product
 
@@ -51,6 +66,24 @@ def get_products(
     max_price: float | None = None,
     db: Session = Depends(get_db)
 ):
+    if (
+        min_price is not None
+        and max_price is not None
+        and min_price > max_price
+    ):
+        raise HTTPException(400, "Invalid price range")
+
+    filters = {
+        "category_id": category_id,
+        "min_price": min_price,
+        "max_price": max_price
+    }
+
+    cached_products, cache_key = get_cached_products(filters)
+
+    if cached_products is not None:
+        return cached_products
+
     query = select(Product)
 
     if category_id is not None:
@@ -62,7 +95,19 @@ def get_products(
     if max_price is not None:
         query = query.where(Product.price <= max_price)
 
-    return db.scalars(query).all()
+    products = db.scalars(query).all()
+
+    result = [
+        ProductResponse.model_validate(
+            product,
+            from_attributes=True
+        ).model_dump(mode="json")
+        for product in products
+    ]
+
+    set_cached_products(cache_key, result)
+
+    return result
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
@@ -102,8 +147,14 @@ def replace_product(
     for key, value in data.model_dump().items():
         setattr(product, key, value)
 
-    db.commit()
-    db.refresh(product)
+    try:
+        db.commit()
+        db.refresh(product)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "Could not update product")
+
+    invalidate_product_cache()
 
     return product
 
@@ -138,8 +189,14 @@ def update_product(
     for key, value in updates.items():
         setattr(product, key, value)
 
-    db.commit()
-    db.refresh(product)
+    try:
+        db.commit()
+        db.refresh(product)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(400, "Could not update product")
+
+    invalidate_product_cache()
 
     return product
 
@@ -159,11 +216,22 @@ def delete_product(
         raise HTTPException(403, "Access denied")
 
     existing_order = db.scalar(
-        select(OrderItem.id).where(OrderItem.product_id == product_id)
+        select(OrderItem.id).where(
+            OrderItem.product_id == product_id
+        )
     )
 
     if existing_order is not None:
         raise HTTPException(409, "Product has order history")
+
+    existing_review = db.scalar(
+        select(Review.id).where(
+            Review.product_id == product_id
+        )
+    )
+
+    if existing_review is not None:
+        raise HTTPException(409, "Product has reviews")
 
     cart_items = db.scalars(
         select(Cart).where(Cart.product_id == product_id)
@@ -173,4 +241,11 @@ def delete_product(
         db.delete(item)
 
     db.delete(product)
-    db.commit()
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Product cannot be deleted")
+
+    invalidate_product_cache()

@@ -1,18 +1,24 @@
 
 import hashlib
+import logging
 from uuid import uuid4
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+
 from jwt.exceptions import InvalidTokenError
+from celery.exceptions import CeleryError
 
 from database.connection import get_db
+
 from models.user_model import User
 from models.auth_session_model import AuthSession
+
 from schema.auth_schema import (
     RegisterRequest,
     TokenResponse,
@@ -20,11 +26,20 @@ from schema.auth_schema import (
     MessageResponse,
     UserResponse
 )
+
 from utils.password import hash_password, verify_password
 from utils.security import create_token, decode_token
 from utils.dependencies import get_current_user
 
-router = APIRouter(prefix="/auth", tags=["Authentication"])
+from rate_limit.login_limiter import check_login_limit
+from celery_app.email_tasks import send_welcome_email
+
+router = APIRouter(
+    prefix="/auth",
+    tags=["Authentication"]
+)
+
+logger = logging.getLogger(__name__)
 
 
 def get_token_hash(jti: str):
@@ -39,19 +54,26 @@ def invalid_token():
     )
 
 
-@router.post("/register", response_model=UserResponse, status_code=201)
+@router.post(
+    "/register",
+    response_model=UserResponse,
+    status_code=201
+)
 def register(
     data: RegisterRequest,
     db: Session = Depends(get_db)
 ):
-    email = str(data.email).lower()
+    email = str(data.email).strip().lower()
 
     existing = db.scalar(
         select(User).where(User.email == email)
     )
 
     if existing:
-        raise HTTPException(409, "Email already registered")
+        raise HTTPException(
+            status_code=409,
+            detail="Email already registered"
+        )
 
     user = User(
         name=data.name,
@@ -66,17 +88,42 @@ def register(
     try:
         db.commit()
         db.refresh(user)
+
     except IntegrityError:
         db.rollback()
-        raise HTTPException(409, "Email already registered")
+        raise HTTPException(
+            status_code=409,
+            detail="Email already registered"
+        )
+
+    try:
+        send_welcome_email.delay(
+            user.email,
+            user.name
+        )
+
+        logger.info(
+            "Welcome email queued for user ID %s",
+            user.id
+        )
+
+    except (CeleryError, OSError):
+        logger.exception(
+            "Could not queue welcome email for user ID %s",
+            user.id
+        )
 
     return user
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse
+)
 def login(
     form: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(check_login_limit)
 ):
     email = form.username.strip().lower()
 
@@ -84,19 +131,27 @@ def login(
         select(User).where(User.email == email)
     )
 
-    if not user or not verify_password(
-        form.password, user.hashed_password
+    if not user:
+        raise invalid_token()
+
+    if not verify_password(
+        form.password,
+        user.hashed_password
     ):
         raise invalid_token()
 
     session_id = str(uuid4())
 
     access_token, _, _ = create_token(
-        user.id, session_id, "access"
+        user.id,
+        session_id,
+        "access"
     )
 
     refresh_token, jti, expires = create_token(
-        user.id, session_id, "refresh"
+        user.id,
+        session_id,
+        "refresh"
     )
 
     session = AuthSession(
@@ -108,7 +163,12 @@ def login(
     )
 
     db.add(session)
-    db.commit()
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
     return {
         "access_token": access_token,
@@ -117,18 +177,30 @@ def login(
     }
 
 
-@router.post("/refresh", response_model=TokenResponse)
+@router.post(
+    "/refresh",
+    response_model=TokenResponse
+)
 def refresh(
     data: RefreshRequest,
     db: Session = Depends(get_db)
 ):
     try:
-        payload = decode_token(data.refresh_token, "refresh")
+        payload = decode_token(
+            data.refresh_token,
+            "refresh"
+        )
+
         user_id = int(payload["sub"])
         session_id = payload["sid"]
         token_hash = get_token_hash(payload["jti"])
 
-    except (InvalidTokenError, ValueError, TypeError, KeyError):
+    except (
+        InvalidTokenError,
+        ValueError,
+        TypeError,
+        KeyError
+    ):
         raise invalid_token()
 
     session = db.scalar(
@@ -137,7 +209,10 @@ def refresh(
         .with_for_update()
     )
 
-    if not session or session.revoked or session.user_id != user_id:
+    if not session:
+        raise invalid_token()
+
+    if session.revoked or session.user_id != user_id:
         raise invalid_token()
 
     if session.refresh_expires_at <= datetime.now(timezone.utc):
@@ -154,11 +229,15 @@ def refresh(
         raise invalid_token()
 
     access_token, _, _ = create_token(
-        user.id, session_id, "access"
+        user.id,
+        session_id,
+        "access"
     )
 
     refresh_token, new_jti, expires = create_token(
-        user.id, session_id, "refresh"
+        user.id,
+        session_id,
+        "refresh"
     )
 
     session.refresh_jti_hash = get_token_hash(new_jti)
@@ -173,7 +252,10 @@ def refresh(
     }
 
 
-@router.post("/logout", response_model=MessageResponse)
+@router.post(
+    "/logout",
+    response_model=MessageResponse
+)
 def logout(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -190,9 +272,16 @@ def logout(
 
     db.commit()
 
-    return {"message": "Logged out from all sessions successfully"}
+    return {
+        "message": "Logged out from all sessions successfully"
+    }
 
 
-@router.get("/me", response_model=UserResponse)
-def get_profile(user: User = Depends(get_current_user)):
+@router.get(
+    "/me",
+    response_model=UserResponse
+)
+def get_profile(
+    user: User = Depends(get_current_user)
+):
     return user

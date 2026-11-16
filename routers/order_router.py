@@ -1,7 +1,7 @@
 
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,10 +11,10 @@ from models.product_model import Product
 from models.cart_model import Cart
 from models.order_model import Order
 from models.order_item_model import OrderItem
-from schema.order_schema import (
-    OrderCreate, OrderUpdate, OrderResponse
-)
+
+from schema.order_schema import OrderCreate, OrderUpdate, OrderResponse
 from utils.dependencies import get_current_user, allow_roles
+from background_tasks.notification_task import send_order_confirmation
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
@@ -22,6 +22,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.post("/", response_model=OrderResponse, status_code=201)
 def create_order(
     data: OrderCreate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     user: User = Depends(allow_roles("customer"))
 ):
@@ -100,6 +101,13 @@ def create_order(
         db.rollback()
         raise
 
+    background_tasks.add_task(
+        send_order_confirmation,
+        user.email,
+        order.id,
+        str(order.total_amount)
+    )
+
     return order
 
 
@@ -126,7 +134,9 @@ def get_orders(
     else:
         raise HTTPException(403, "Access denied")
 
-    return db.scalars(query.order_by(Order.id.desc())).all()
+    return db.scalars(
+        query.order_by(Order.id.desc())
+    ).all()
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
@@ -140,10 +150,11 @@ def get_order(
     if not order:
         raise HTTPException(404, "Order not found")
 
-    if user.role == "customer" and order.user_id != user.id:
-        raise HTTPException(403, "Access denied")
+    if user.role == "customer":
+        if order.user_id != user.id:
+            raise HTTPException(403, "Access denied")
 
-    if user.role == "shopkeeper":
+    elif user.role == "shopkeeper":
         seller_product = db.scalar(
             select(OrderItem.id)
             .join(Product, Product.id == OrderItem.product_id)
@@ -155,6 +166,9 @@ def get_order(
 
         if seller_product is None:
             raise HTTPException(403, "Access denied")
+
+    elif user.role != "admin":
+        raise HTTPException(403, "Access denied")
 
     return order
 
@@ -184,10 +198,15 @@ def update_order_status(
         if not items:
             raise HTTPException(403, "Access denied")
 
-        seller_ids = {
-            db.get(Product, item.product_id).seller_id
-            for item in items
-        }
+        seller_ids = set()
+
+        for item in items:
+            product = db.get(Product, item.product_id)
+
+            if not product:
+                raise HTTPException(409, "Order product not found")
+
+            seller_ids.add(product.seller_id)
 
         if seller_ids != {user.id}:
             raise HTTPException(403, "Cannot manage this order")

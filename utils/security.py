@@ -42,6 +42,8 @@ def create_token(user_id: int, session_id: str, token_type: str):
     return token, jti, expires
 
 
+
+
 def decode_token(token: str, expected_type: str):
     payload = jwt.decode(
         token,

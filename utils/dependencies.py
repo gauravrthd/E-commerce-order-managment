@@ -11,7 +11,7 @@ from utils.security import decode_token
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
-
+# get current user .
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
@@ -50,7 +50,7 @@ def get_current_user(
 
     return user
 
-
+#check user role  means athorizaion 
 def allow_roles(*roles):
 
     def check_role(user: User = Depends(get_current_user)):
@@ -64,10 +64,12 @@ def allow_roles(*roles):
 
     return check_role
 
-
+# check user is owener or admin
 def check_owner_or_admin(user: User, owner_id: int):
     if user.role != "admin" and user.id != owner_id:
         raise HTTPException(
             status_code=403,
             detail="Access denied"
         )
+
+# this all function use in project multiple times reuse function . this function use as a dependencies function.

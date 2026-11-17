@@ -1,19 +1,16 @@
 
 import json
 import logging
-import os
-from pathlib import Path
 
 import redis
-from dotenv import load_dotenv
 from redis.exceptions import RedisError
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 redis_client = redis.Redis.from_url(
-    os.getenv("REDIS_CACHE_URL", "redis://localhost:6379/0"),
+    settings.REDIS_CACHE_URL,
     decode_responses=True,
     socket_connect_timeout=2,
     socket_timeout=2
@@ -28,7 +25,10 @@ def get_cached_products(filters: dict):
         version = redis_client.get(VERSION_KEY) or "1"
 
         cache_key = "products:" + json.dumps(
-            {"version": version, "filters": filters},
+            {
+                "version": version,
+                "filters": filters
+            },
             sort_keys=True
         )
 

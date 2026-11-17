@@ -1,19 +1,17 @@
-import os
-from pathlib import Path
+
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import jwt
-from dotenv import load_dotenv
 from jwt.exceptions import InvalidTokenError
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+from config.settings import settings
 
-SECRET_KEY = os.environ["JWT_SECRET_KEY"]
+SECRET_KEY = settings.JWT_SECRET_KEY
 ALGORITHM = "HS256"
 
-ACCESS_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
-REFRESH_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+ACCESS_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
+REFRESH_DAYS = settings.REFRESH_TOKEN_EXPIRE_DAYS
 
 
 def create_token(user_id: int, session_id: str, token_type: str):
@@ -37,7 +35,11 @@ def create_token(user_id: int, session_id: str, token_type: str):
         "exp": expires
     }
 
-    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    token = jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
 
     return token, jti, expires
 
@@ -48,7 +50,9 @@ def decode_token(token: str, expected_type: str):
         SECRET_KEY,
         algorithms=[ALGORITHM],
         options={
-            "require": ["sub", "sid", "jti", "type", "iat", "exp"]
+            "require": [
+                "sub", "sid", "jti", "type", "iat", "exp"
+            ]
         }
     )
 

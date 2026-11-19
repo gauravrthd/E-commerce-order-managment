@@ -1,10 +1,6 @@
 
-import logging
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from middleware.logging_middleware import logging_middleware
 
 from routers import (
     auth_router,
@@ -19,17 +15,19 @@ from routers import (
     payment_router
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s"
-)
+from observability.logging_config import configure_logging
+from observability.request_middleware import ObservabilityMiddleware
+from observability.metrics import metrics_endpoint
+
+
+configure_logging()
 
 app = FastAPI(
     title="E-Commerce Order Management System",
+    description="FastAPI backend for managing users, products, carts, orders and payments",
     version="1.0.0"
 )
 
-app.middleware("http")(logging_middleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,16 +38,9 @@ app.add_middleware(
         "http://127.0.0.1:5173"
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"]
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
-
-
-@app.get("/")
-def welcome():
-    return {
-        "message": "Welcome to my E-Commerce Order Management System!"
-    }
 
 
 app.include_router(auth_router.router)
@@ -62,3 +53,21 @@ app.include_router(order_item_router.router)
 app.include_router(cancellation_router.router)
 app.include_router(review_router.router)
 app.include_router(payment_router.router)
+
+
+@app.get("/", tags=["Root"])
+def root():
+    return {
+        "message": "Welcome to my E-Commerce Order Management System!"
+    }
+
+
+app.add_api_route(
+    "/metrics",
+    metrics_endpoint,
+    methods=["GET"],
+    include_in_schema=False
+)
+
+
+app.add_middleware(ObservabilityMiddleware)

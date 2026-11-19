@@ -19,9 +19,4 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["gunicorn", "main:app", \
-     "--workers", "2", \
-     "--worker-class", "uvicorn_worker.UvicornWorker", \
-     "--bind", "0.0.0.0:8000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-"]
+CMD ["sh", "/app/start.sh"]
